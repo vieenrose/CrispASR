@@ -4,6 +4,7 @@
 #include "gguf_loader.h"
 
 #include "ggml-backend-impl.h"
+#include "gguf.h"  // full gguf_context: find_key() dereferences it
 #include "ggml-cpu.h"
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
@@ -17,6 +18,13 @@
 #include <limits>
 #include <map>
 #include <mutex>
+
+// Defined at the bottom with the tensor lookup helpers; declared here because the metadata accessors below
+// are prefix-aware too (a GGUF bundle stores one model's keys under "<prefix>...", and a helper that quietly
+// returned its default instead would look like a corrupt model, not like a missing prefix).
+namespace core_gguf {
+int64_t find_key(const struct gguf_context * ctx, const char * key);
+}
 #include <tuple>
 
 // core_cpu_backend:: is used unconditionally below (the zero-copy CPU mmap
@@ -65,7 +73,7 @@ void free_metadata(gguf_context* gctx) {
 // helpers in each model.
 
 uint32_t kv_u32(gguf_context* gctx, const char* key, uint32_t default_val) {
-    const int k = gguf_find_key(gctx, key);
+    const int k = find_key(gctx, key);
     if (k < 0)
         return default_val;
     const gguf_type t = gguf_get_kv_type(gctx, k);
@@ -92,7 +100,7 @@ uint32_t kv_u32(gguf_context* gctx, const char* key, uint32_t default_val) {
 }
 
 int32_t kv_i32(gguf_context* gctx, const char* key, int32_t default_val) {
-    const int k = gguf_find_key(gctx, key);
+    const int k = find_key(gctx, key);
     if (k < 0)
         return default_val;
     const gguf_type t = gguf_get_kv_type(gctx, k);
@@ -111,7 +119,7 @@ int32_t kv_i32(gguf_context* gctx, const char* key, int32_t default_val) {
 }
 
 float kv_f32(gguf_context* gctx, const char* key, float default_val) {
-    const int k = gguf_find_key(gctx, key);
+    const int k = find_key(gctx, key);
     if (k < 0)
         return default_val;
     const gguf_type t = gguf_get_kv_type(gctx, k);
@@ -123,7 +131,7 @@ float kv_f32(gguf_context* gctx, const char* key, float default_val) {
 }
 
 bool kv_bool(gguf_context* gctx, const char* key, bool default_val) {
-    const int k = gguf_find_key(gctx, key);
+    const int k = find_key(gctx, key);
     if (k < 0)
         return default_val;
     if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_BOOL)
@@ -132,7 +140,7 @@ bool kv_bool(gguf_context* gctx, const char* key, bool default_val) {
 }
 
 std::string kv_str(gguf_context* gctx, const char* key, const char* default_val) {
-    const int k = gguf_find_key(gctx, key);
+    const int k = find_key(gctx, key);
     if (k < 0)
         return default_val ? default_val : "";
     if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_STRING)
@@ -143,7 +151,7 @@ std::string kv_str(gguf_context* gctx, const char* key, const char* default_val)
 
 std::vector<std::string> kv_str_array(gguf_context* gctx, const char* key) {
     std::vector<std::string> out;
-    const int k = gguf_find_key(gctx, key);
+    const int k = find_key(gctx, key);
     if (k < 0)
         return out;
     if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_ARRAY)
@@ -160,7 +168,7 @@ std::vector<std::string> kv_str_array(gguf_context* gctx, const char* key) {
 
 std::vector<float> kv_f32_array(gguf_context* gctx, const char* key) {
     std::vector<float> out;
-    const int k = gguf_find_key(gctx, key);
+    const int k = find_key(gctx, key);
     if (k < 0)
         return out;
     if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_ARRAY)
@@ -1575,18 +1583,67 @@ void mmap_advise_random(ggml_backend_buffer_t buf) {
 // ---------------------------------------------------------------------------
 
 // Signatures use `core_gguf::tensor_map` (see gguf_loader.h cross-repo contract).
+//
+// BUNDLE SUPPORT. set_name_prefix() lets one GGUF hold several models: every lookup is retried as
+// "<prefix><name>" before the bare name, so a single-model file keeps working with a prefix set and a
+// bundle can hand each model its own namespace. The prefix is read once from CRISPASR_GGUF_PREFIX; it is a
+// lookup detail only, so a bundle produces bit-identical weights and therefore bit-identical output - this
+// is a deployment change (one file, one mmap), not a numerical one.
 ggml_tensor* try_get(const tensor_map& tensors, const char* name) {
     auto it = tensors.find(name);
-    return it != tensors.end() ? it->second : nullptr;
+    if (it != tensors.end()) {
+        return it->second;
+    }
+    const std::string & p = name_prefix();
+    if (!p.empty()) {
+        it = tensors.find(p + name);
+        if (it != tensors.end()) {
+            return it->second;
+        }
+    }
+    return nullptr;
+}
+
+std::string & prefix_storage() {
+    static std::string prefix = [] {
+        const char * env = std::getenv("CRISPASR_GGUF_PREFIX");
+        return env ? std::string(env) : std::string();
+    }();
+    return prefix;
+}
+
+const std::string & name_prefix() {
+    return prefix_storage();
+}
+
+void set_name_prefix(const char * prefix) {
+    std::lock_guard<std::mutex> lock(prefix_mutex());
+    prefix_storage() = prefix ? prefix : "";
+}
+
+std::mutex & prefix_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+int64_t find_key(const struct gguf_context * ctx, const char * key) {
+    int64_t id = gguf_find_key(ctx, key);
+    if (id < 0) {
+        const std::string & p = name_prefix();
+        if (!p.empty()) {
+            id = gguf_find_key(ctx, (p + key).c_str());
+        }
+    }
+    return id;
 }
 
 ggml_tensor* require(const tensor_map& tensors, const char* name, const char* model_tag) {
-    auto it = tensors.find(name);
-    if (it == tensors.end()) {
+    ggml_tensor * t = try_get(tensors, name);
+    if (!t) {
         fprintf(stderr, "%s: required tensor '%s' not found in GGUF\n", model_tag ? model_tag : "core_gguf", name);
         return nullptr;
     }
-    return it->second;
+    return t;
 }
 
 std::string format_layer_name(const char* fmt, int i) {

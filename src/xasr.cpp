@@ -192,7 +192,9 @@ std::vector<float> to_f32(ggml_tensor* t) {
 
 std::vector<int> kv_int_array(gguf_context* g, const char* key) {
     std::vector<int> out;
-    const int64_t id = gguf_find_key(g, key);
+    // Prefix-aware: in a GGUF bundle this model's metadata lives under "<prefix>xasr.*", and falling back
+    // to the bare key is what keeps single-model files working unchanged.
+    const int64_t id = core_gguf::find_key(g, key);
     if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY)
         return out;
     const size_t n = gguf_get_arr_n(g, id);

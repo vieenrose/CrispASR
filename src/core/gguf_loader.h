@@ -55,7 +55,10 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <mutex>
 #include <vector>
+
+struct gguf_context;  // global scope: a declaration inside core_gguf would be a DIFFERENT type
 
 namespace core_gguf {
 
@@ -316,7 +319,25 @@ void mmap_advise_random(ggml_backend_buffer_t buf);
 // Look up a tensor by name. Returns nullptr (silently) if missing.
 // Uses `tensor_map` (see the cross-repo contract note above) so the signature
 // tracks the per-repo map choice automatically.
+// If a name prefix is configured (CRISPASR_GGUF_PREFIX, or set_name_prefix()), the prefixed name is tried
+// as well: that is what lets one GGUF bundle hold several models.
 ggml_tensor* try_get(const tensor_map& tensors, const char* name);
+
+// Active tensor-name prefix ("" when unset). Read once from CRISPASR_GGUF_PREFIX; the internal accessor
+// is exposed for the prefix-aware key lookup below, not for callers to mutate.
+const std::string& name_prefix();
+
+// Override the prefix programmatically (takes precedence over the environment). Thread-safe.
+void set_name_prefix(const char* prefix);
+
+// Internal: mutable storage behind name_prefix(), plus the mutex that guards it against a concurrent
+// set_name_prefix(). Declared here only so the implementation can order its definitions; not part of the
+// contract.
+std::string& prefix_storage();
+std::mutex& prefix_mutex();
+
+// Prefix-aware metadata lookup: tries `key`, then "<prefix><key>". Returns the ggml key id or -1.
+int64_t find_key(const struct gguf_context* ctx, const char* key);
 
 // Look up a tensor by name. Prints an error to stderr if missing but
 // still returns nullptr — the caller decides whether a missing tensor

@@ -43,6 +43,12 @@ char* xasr_stream_accept(struct xasr_stream* s, const float* samples, int n_samp
 void xasr_stream_reset(struct xasr_stream* s);
 void xasr_stream_free(struct xasr_stream* s);
 
+// Token timestamps: (ids, encoder-frame indices) for everything decoded so far. Borrowed pointers,
+// valid until the next accept/reset/free. Frame k starts at k * 40 ms of audio (10 ms fbank hop,
+// encoder downsampling of 4). Returns 0 with *out_n == 0 if nothing has been decoded.
+int xasr_stream_token_times(struct xasr_stream* s, const int32_t** out_ids,
+                            const int64_t** out_frames, int* out_n);
+
 // ---- diff-harness hooks (crispasr-diff xasr) -----------------------------
 // Kaldi fbank of samples + the configured tail padding: (T, 80) row-major, malloc'd.
 float* xasr_compute_fbank(struct xasr_context* ctx, const float* samples, int n_samples, int* out_T);
