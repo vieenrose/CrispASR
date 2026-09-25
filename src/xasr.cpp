@@ -719,12 +719,28 @@ void set_input(ggml_cgraph* gf, const std::string& name, const float* v, size_t 
     ggml_backend_tensor_set(t, v, 0, n * sizeof(float));
 }
 
+void get_output_into(ggml_cgraph* gf, const std::string& name, std::vector<float>& dst);
+
 std::vector<float> get_output(ggml_cgraph* gf, const std::string& name) {
+    std::vector<float> v;
+    get_output_into(gf, name, v);
+    return v;
+}
+
+// Read a graph output into an EXISTING buffer. Bit-identical to get_output() - same bytes, same values - but
+// it reuses the caller's allocation instead of returning a fresh vector.
+//
+// Why that matters here: the streaming loop reads 6 caches per layer per step (114 per step, ~145 steps per
+// 69 s clip), and assigning a returned vector to kv.second freed the previous buffer and allocated a new one
+// every single time. Most of those blocks are larger than glibc's 128 KB mmap threshold, so each one is an
+// mmap/munmap pair with its page faults and TLB churn - ~16.5k large allocations per clip to move bytes that
+// were already being copied. The resize() below is a no-op once the size is stable, so after the first step
+// the steady state is a memcpy into a warm buffer.
+void get_output_into(ggml_cgraph* gf, const std::string& name, std::vector<float>& dst) {
     ggml_tensor* t = ggml_graph_get_tensor(gf, name.c_str());
     GGML_ASSERT(t);
-    std::vector<float> v((size_t)ggml_nelements(t));
-    ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
-    return v;
+    dst.resize((size_t)ggml_nelements(t));
+    ggml_backend_tensor_get(t, dst.data(), 0, dst.size() * sizeof(float));
 }
 
 // Zero caches, sized from the graph's inputs.
@@ -815,6 +831,7 @@ bool run_chunks(xasr_context* c, std::vector<uint8_t>& meta, enc_state& st, cons
     }
     if (dump && dumps->size() != (size_t)S + 2)
         dumps->assign((size_t)S + 2, {});
+    std::vector<float> enc_step;   // reused across steps; sized once the encoder output shape is stable
     for (; *pos + G.T < n_rows; *pos += G.decode_chunk_len) {
         const auto ti0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         set_input(gf, "feats", feats + (size_t)*pos * hp.feature_dim, (size_t)G.T * hp.feature_dim);
@@ -843,10 +860,10 @@ bool run_chunks(xasr_context* c, std::vector<uint8_t>& meta, enc_state& st, cons
             xasr_prof::get().compute_s += std::chrono::duration<double>(to0 - tc0).count();
         }
         for (auto& kv : st.caches)
-            kv.second = get_output(gf, "o_" + kv.first);
+            get_output_into(gf, "o_" + kv.first, kv.second);
         st.processed += G.chunk;
-        const auto e = get_output(gf, "enc_out");
-        enc_out.insert(enc_out.end(), e.begin(), e.end());
+        get_output_into(gf, "enc_out", enc_step);
+        enc_out.insert(enc_out.end(), enc_step.begin(), enc_step.end());
         if (prof) {
             xasr_prof::get().outputs_s += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - to0).count();
