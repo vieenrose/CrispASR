@@ -22,6 +22,9 @@
 
 #include <algorithm>
 #include <chrono>
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -101,6 +104,7 @@ struct acc {
     // rebuilds, positional-encoding tables, input/output copies, the fbank), which is where the mel
     // filterbank surprise lived on the diar side.
     double fbank_s = 0, build_s = 0, alloc_s = 0, pe_s = 0, inputs_s = 0, compute_s = 0, outputs_s = 0;
+    double greedy_s = 0;
     int64_t build_calls = 0, steps = 0;
     int64_t total_us = 0;
     int64_t nodes = 0;
@@ -162,15 +166,16 @@ inline void dump() {
     }
     std::fprintf(stderr,
                  "[xasr-prof] host phases: fbank %.3f s | build %.3f s (%lld calls) alloc %.3f s | "
-                 "pos-enc %.3f s | inputs %.3f s | compute %.3f s (%lld steps) | outputs %.3f s\n",
+                 "pos-enc %.3f s | inputs %.3f s | compute %.3f s (%lld steps) | outputs %.3f s | "
+                 "greedy/joint %.3f s\n",
                  a.fbank_s, a.build_s, (long long) a.build_calls, a.alloc_s, a.pe_s,
-                 a.inputs_s, a.compute_s, (long long) a.steps, a.outputs_s);
+                 a.inputs_s, a.compute_s, (long long) a.steps, a.outputs_s, a.greedy_s);
     a.us.clear();
     a.calls.clear();
     a.bytes.clear();
     a.total_us = 0;
     a.nodes = 0;
-    a.fbank_s = a.build_s = a.alloc_s = a.pe_s = a.inputs_s = a.compute_s = a.outputs_s = 0.0;
+    a.fbank_s = a.build_s = a.alloc_s = a.pe_s = a.inputs_s = a.compute_s = a.outputs_s = a.greedy_s = 0.0;
     a.build_calls = 0;
     a.steps = 0;
 }
@@ -915,6 +920,25 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
             t[(size_t)j] = std::tanh(e[j] + gs.d[(size_t)j]);
         int best = 0;
         for (int v = 0; v < V; v++) {
+            // MEASURED, AND LEFT ALONE ON PURPOSE. This is a [5000 x 512] matvec per encoder frame: 2.56M
+            // multiply-adds, 4.4 GMAC per 69 s clip, 3.87 s measured on the phone - 31% of the ASR leg, and
+            // invisible to the ggml op profile because it is plain host C++.
+            //
+            // Two ways of attacking it were implemented and measured, and NEITHER worked:
+            //   * four independent NEON accumulators (vfmaq_f32 x4): 3.87 -> 3.84 s. The build does have NEON
+            //     (-mcpu=cortex-a78 defines __ARM_NEON), so this is not a silently-disabled path.
+            //   * sharing one pass over the 10.2 MB joint matrix across a block of frames that share the
+            //     decoder state (only ~78% of frames emit a token): 3.87 -> 6.43 s, i.e. clearly worse.
+            // The second one also taught the shape of the problem: batching is only valid while the decoder
+            // state d is unchanged, because a token emission rewrites d and every later frame in the batch
+            // must be recomputed - and the frame index bookkeeping that implies (per-frame token timestamps,
+            // and enc being indexed from this call's first frame while timestamps are global) is easy to get
+            // wrong in ways the byte-identity gate catches immediately.
+            //
+            // So the remaining route is reducing the BYTES: the weights are streamed at ~4.5 GB/s and each
+            // element is used exactly once, so storing the joint matrix as f16 (5.1 MB) or q8_0 (2.6 MB)
+            // should cut this phase by up to 2x/4x. Both change the logits, so they need the paired
+            // validation (.auto/validate.sh) and a deliberate re-bless - not this file's byte-identity gate.
             float acc = m.join_out_b[(size_t)v];
             const float* w = m.join_out_w.data() + (size_t)v * J;
             for (int j = 0; j < J; j++)
@@ -1211,7 +1235,13 @@ bool stream_accept(xasr_stream* s, const float* pcm, int n, bool flush) {
     std::vector<float> enc;
     if (!run_chunks(s->c, s->meta, s->st, s->feats.data(), s->n_frames, &s->pos, enc, nullptr))
         return false;
+    const bool prof = xasr_prof::get().on;
+    const auto tg0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     greedy_run(s->c->model, s->gs, enc.data(), (int)(enc.size() / (size_t)s->c->model.hp.joiner_dim), nullptr);
+    if (prof) {
+        xasr_prof::get().greedy_s += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tg0).count();
+    }
     s->finished = flush;
     return true;
 }
