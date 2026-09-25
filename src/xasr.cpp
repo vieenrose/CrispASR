@@ -98,6 +98,8 @@ struct geom {
 // identical with it on. The point is to stop guessing where the ASR leg's arithmetic goes before deciding
 // which kernel is worth writing - the leg is weight-format insensitive (q4_k ties q5_0), so the only lever
 // left is the op mix itself.
+extern "C" uint64_t g_ggml_quant_elems;   // diagnostic counter, see ggml-cpu.c (GGML_COUNT_QUANT)
+
 namespace xasr_prof {
 
 struct acc {
@@ -168,6 +170,12 @@ inline void dump() {
                      op_name(r.first), r.second / 1e6, 100.0 * r.second / a.total_us,
                      (long long)nc, nc ? r.second / (double)nc : 0.0,
                      nb / 1048576.0, nc ? nb / 1024.0 / (double)nc : 0.0);
+    }
+    if (getenv("GGML_COUNT_QUANT")) {
+        std::fprintf(stderr,
+                     "[xasr-prof] activation elements quantised by mul_mat: %.1f M  (%.1f B blocks of 4 B read; "
+                     "at ~1-2 cycles/element this is the prize for memoising the conversion)\n",
+                     g_ggml_quant_elems / 1e6, g_ggml_quant_elems * 4 / 1e9);
     }
     std::fprintf(stderr,
                  "[xasr-prof] host phases: fbank %.3f s | build %.3f s (%lld calls) alloc %.3f s | "
