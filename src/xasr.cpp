@@ -1131,13 +1131,25 @@ extern "C" struct xasr_context* xasr_init_from_file(const char* path, struct xas
     for (size_t i = 0; i < hp.chunk_ms_table.size() && i < hp.left_ctx_table.size(); i++)
         if (hp.chunk_ms_table[i] == G.chunk_ms)
             left = hp.left_ctx_table[i];
+    // EXPERIMENT HOOK. left_context_frames is a table indexed by chunk_ms ([160, 480, 960, 1920] ->
+    // [96, 256, 256, 256]), so the shipped 480 ms chunk is paired with 256 frames of left context while a
+    // 160 ms chunk gets 96. Attention cost per stage is O(seq x (left/ds + seq)), so the pairing is a real
+    // compute knob, not a formality - and the model itself ships a smaller context for a smaller chunk.
+    // XASR_LEFT_CTX overrides it for measurement; unset means the model's own pairing, unchanged.
+    if (const char * env_left = getenv("XASR_LEFT_CTX")) {
+        const int requested = atoi(env_left);
+        if (requested > 0)
+            left = requested;
+    }
     int max_ds = 1;
     for (int d : hp.downsample)
         max_ds = std::max(max_ds, d);
     G.decode_chunk_len = G.chunk_ms / 10;
     G.chunk = G.decode_chunk_len / 2;
     // every stack's SimpleDownsample and the output downsample-by-2 need exact groups
-    if (left < 0 || G.chunk % max_ds != 0 || G.chunk % 2 != 0) {
+    // Every stage slices its left context as left/ds, so an override that is not divisible by the largest
+    // downsampling factor would silently truncate some stages.
+    if (left < 0 || G.chunk % max_ds != 0 || G.chunk % 2 != 0 || left % max_ds != 0) {
         fprintf(stderr, "xasr: unsupported chunk size %d ms\n", G.chunk_ms);
         xasr_free(c);
         return nullptr;
