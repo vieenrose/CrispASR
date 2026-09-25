@@ -209,7 +209,8 @@ inline void dump() {
     }
     if (!any)
         return;
-    const acc& a = merged;
+    // non-const: the shape table below indexes the maps, and operator[] is not const-qualified
+    acc& a = merged;
     std::vector<std::pair<int, int64_t>> rows(a.us.begin(), a.us.end());
     std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
     std::fprintf(stderr,
