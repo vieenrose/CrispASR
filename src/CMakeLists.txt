@@ -1228,6 +1228,16 @@ add_library(xasr STATIC
             xasr.cpp
             )
 target_include_directories(xasr PUBLIC . ../include)
+# ../ggml/src: reaches ggml-cpu/quants.h, ggml-cpu's own internal header, for the transducer joint's Q8_0
+# matvec path (reuses quantize_row_q8_0/ggml_vec_dot_q8_0_q8_0 rather than hand-rolling the same numerics).
+target_include_directories(xasr PRIVATE ../ggml/src)
+# xasr.cpp's own inline ARM intrinsics (the transducer joint's f16/q8_0 matvec) are a SEPARATE target from
+# ggml-cpu, which is the only target GGML_CPU_ARM_ARCH's -march flag was otherwise applied to - without this,
+# __ARM_FEATURE_DOTPROD is never defined here even when ggml-cpu next door has dotprod compiled in, and the
+# q8_0 joint path silently compiles out to nothing (found by measuring: the leg time did not move at all).
+if (GGML_CPU_ARM_ARCH)
+    target_compile_options(xasr PRIVATE -march=${GGML_CPU_ARM_ARCH})
+endif()
 target_compile_features   (xasr PUBLIC cxx_std_17)
 set_target_properties(xasr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries     (xasr PUBLIC ggml ggml-base Threads::Threads crispasr-core)

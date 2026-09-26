@@ -19,6 +19,10 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
+#if defined(__ARM_FEATURE_DOTPROD)
+#include "ggml-cpu/quants.h"  // quantize_row_q8_0, ggml_vec_dot_q8_0_q8_0, block_q8_0, QK8_0 - internal
+                               // ggml-cpu header, reused rather than hand-rolling the same numerics
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -86,6 +90,12 @@ struct xasr_model {
     // element, and it measures 3.87 s per 69 s clip - 31% of the ASR leg. Vectorising the arithmetic did not
     // help (3.84 s), so the lever is bytes, not instructions. This halves them.
     std::vector<ggml_fp16_t> join_out_w_f16;
+    // Q8_0 mirror, used when the build actually has ARM dotprod (see docs/pipeline-design.md SS15 - this
+    // project's own Android build never compiled dotprod in until that fix, so this path was pointless
+    // before it and is not gated on __ARM_NEON/__aarch64__ alone like the f16 mirror above). One row is
+    // J/QK8_0 contiguous block_q8_0 structs, reusing ggml's own quantize_row_q8_0/vec_dot rather than
+    // hand-rolling either - same numerics ggml already uses everywhere else in both models.
+    std::vector<uint8_t> join_out_w_q8;
 };
 
 // Chunk geometry, fixed per context.
@@ -461,6 +471,26 @@ bool load(xasr_model& m, const char* path, ggml_backend_t backend) {
         m.join_out_w_f16.resize(m.join_out_w.size());
         for (size_t i = 0; i < m.join_out_w.size(); i++)
             m.join_out_w_f16[i] = ggml_fp32_to_fp16(m.join_out_w[i]);
+    }
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    // Opt-in, NOT automatic: on-device paired validation (docs/pipeline-design.md SS17) found this is not a
+    // clean win like the f16 mirror above was. It IS faster (asr leg -5 to -7% across all 11 validation
+    // clips, consistent), but unlike f16 (WER-identical on all 11 clips) it moves WER both directions -
+    // better on 9 clips, worse on 2 (gate_ms +0.02, gate_ms_g100 +0.05), and holdout_en's 0.2455 exceeds this
+    // repo's own blessed ceiling of 0.2400 (.auto/bless.txt). Net micro-WER across all 11 is slightly
+    // better (0.1073 -> 0.1022), but "better on average, worse on some clips you can name" is a real product
+    // decision, not a bug fix - so it stays off unless asked for, same as this project treats --diar-native.
+    if (getenv("XASR_JOINT_Q8") != nullptr) {
+        const int64_t J = hp.joiner_dim, V = hp.vocab;
+        if (J % QK8_0 == 0 && (int64_t) m.join_out_w.size() == V * J) {
+            const int64_t nb = J / QK8_0;
+            m.join_out_w_q8.resize((size_t) (V * nb) * sizeof(block_q8_0));
+            for (int64_t v = 0; v < V; v++) {
+                quantize_row_q8_0(m.join_out_w.data() + v * J,
+                                   m.join_out_w_q8.data() + (size_t) v * nb * sizeof(block_q8_0), J);
+            }
+        }
     }
 #endif
     m.join_out_b = to_f32(req(m, "join.output_linear.bias"));
@@ -1024,6 +1054,9 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
     const auto& hp = m.hp;
     const int J = hp.joiner_dim, V = hp.vocab;
     std::vector<float> t((size_t)J), logits((size_t)V);
+#if defined(__ARM_FEATURE_DOTPROD)
+    std::vector<uint8_t> t_q8(m.join_out_w_q8.empty() ? 0 : ((size_t)(J / QK8_0)) * sizeof(block_q8_0));
+#endif
     const bool prof_g = xasr_prof::get().on;
     double decout_here = 0.0;
     const auto tl0 = prof_g ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1031,6 +1064,13 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
         const float* e = enc + (size_t)f * J;
         for (int j = 0; j < J; j++)
             t[(size_t)j] = std::tanh(e[j] + gs.d[(size_t)j]);
+#if defined(__ARM_FEATURE_DOTPROD)
+        // Quantised ONCE per frame, not per output row: t is the same activation vector for all V dot
+        // products below, so this is 1/V of the per-row weight-quantisation cost the rest of the model
+        // already pays inside ggml's own mul_mat (kernel-brief.md's "activation requantisation" mechanism,
+        // measured there at well under 1% of the leg for exactly this reason).
+        if (!m.join_out_w_q8.empty()) quantize_row_q8_0(t.data(), t_q8.data(), J);
+#endif
         int best = 0;
         for (int v = 0; v < V; v++) {
             // MEASURED, AND LEFT ALONE ON PURPOSE. This is a [5000 x 512] matvec per encoder frame: 2.56M
@@ -1049,10 +1089,30 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
             // wrong in ways the byte-identity gate catches immediately.
             //
             // So the remaining route is reducing the BYTES: the weights are streamed at ~4.5 GB/s and each
-            // element is used exactly once, so storing the joint matrix as f16 (5.1 MB) or q8_0 (2.6 MB)
-            // should cut this phase by up to 2x/4x. Both change the logits, so they need the paired
-            // validation (.auto/validate.sh) and a deliberate re-bless - not this file's byte-identity gate.
+            // element is used exactly once, so storing the joint matrix as f16 (5.1 MB, done, below) cut
+            // this phase 3.5x. A further q8_0 (2.6 MB) mirror exists (XASR_JOINT_Q8=1, needs
+            // __ARM_FEATURE_DOTPROD) and does cut the ASR leg another 5-7%, but unlike f16 - which was
+            // WER-identical on all 11 validation clips - it moves WER both directions (better on 9, worse on
+            // 2, one exceeding this repo's blessed ceiling), so it is opt-in, not automatic. Full account:
+            // docs/pipeline-design.md SS17.
             float acc = m.join_out_b[(size_t)v];
+#if defined(__ARM_FEATURE_DOTPROD)
+            if (!m.join_out_w_q8.empty()) {
+                // ggml's own quantize_row_q8_0/ggml_vec_dot_q8_0_q8_0 - same block layout and int8 SDOT
+                // accumulation the rest of both models already use inside their ggml graphs, called directly
+                // here because the joint is plain host C++, not a ggml op (see the block comment above).
+                const int64_t nb = J / QK8_0;
+                float dot = 0.0f;
+                ggml_vec_dot_q8_0_q8_0(J, &dot, 0,
+                    m.join_out_w_q8.data() + (size_t) v * nb * sizeof(block_q8_0), 0,
+                    t_q8.data(), 0, 1);
+                acc += dot;
+                logits[(size_t)v] = acc;
+                if (acc > logits[(size_t)best])
+                    best = v;
+                continue;
+            }
+#endif
 #if defined(__ARM_NEON) || defined(__aarch64__)
             if (!m.join_out_w_f16.empty()) {
                 // One accumulator, ascending j, widening each f16 group to f32 before the FMA: the only
